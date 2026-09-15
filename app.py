@@ -1,6 +1,14 @@
 """
 Microservice BTC (ChordMini) — detecção de acordes via modelo BTC-SL.
 
+Recebe um audio_url, baixa o áudio, roda o modelo BTC do ChordMini
+(commit 3d186fc — github.com/ptnghia-j/ChordMini) usando o wrapper real
+btc_chord_recognition.py e retorna a timeline de acordes com timestamps
+reais (formato .lab parseado), sem snap para downbeat — o smoothing é
+nativo do transformador.
+
+Deploy: Railway. Ver README.md em base44/shared/btc-microservice/.
+
 POST /analyze  { audio_url }  ->  { chords: [{ chord, start, end }, ...] }
 GET  /health                  ->  { status: "ok" }
 """
@@ -14,6 +22,8 @@ from pydantic import BaseModel
 
 app = FastAPI(title="BTC Chord Service")
 API_KEY = os.environ.get("BTC_API_KEY", "")
+
+# Diretório do ChordMini clonado no build do Docker (commit 3d186fc)
 CHORDMINI_DIR = os.environ.get("CHORDMINI_DIR", "/app/ChordMini")
 
 
@@ -27,6 +37,7 @@ def verify_key(x_api_key: str):
 
 
 def parse_lab_file(lab_path):
+    """Lê um .lab (start\\tend\\tchord) e retorna [{chord, start, end}, ...]."""
     chords = []
     with open(lab_path, "r") as f:
         for line in f:
@@ -47,6 +58,7 @@ def parse_lab_file(lab_path):
 async def analyze(req: AnalyzeRequest, x_api_key: str = Header(...)):
     verify_key(x_api_key)
 
+    # 1. Baixa o áudio para um arquivo temporário
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -56,10 +68,12 @@ async def analyze(req: AnalyzeRequest, x_api_key: str = Header(...)):
             os.unlink(tmp_path)
         raise HTTPException(status_code=502, detail=f"Download falhou: {e}")
 
+    # 2. Arquivo .lab de saída
     with tempfile.NamedTemporaryFile(suffix=".lab", delete=False) as lab_tmp:
         lab_path = lab_tmp.name
 
     try:
+        # 3. Inferência usando o wrapper real do ChordMini (btc_chord_recognition.py)
         sys.path.insert(0, CHORDMINI_DIR)
         from btc_chord_recognition import btc_chord_recognition
 
