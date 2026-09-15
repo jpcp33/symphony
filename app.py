@@ -1,12 +1,5 @@
 """
-Microservice BTC (ChordMini) — protótipo de detecção de acordes.
-
-Recebe um audio_url, baixa o áudio, roda o modelo BTC do ChordMini
-(github.com/ptnghia-j/ChordMini) e retorna a timeline de acordes
-com timestamps reais — sem snap para downbeat, com smoothing nativo
-do transformador.
-
-Deploy: Railway (mesmo padrão do yt-dlp). Ver README.md em base44/shared/btc-microservice/.
+Microservice BTC (ChordMini) — detecção de acordes via modelo BTC-SL.
 
 POST /analyze  { audio_url }  ->  { chords: [{ chord, start, end }, ...] }
 GET  /health                  ->  { status: "ok" }
@@ -21,6 +14,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="BTC Chord Service")
 API_KEY = os.environ.get("BTC_API_KEY", "")
+CHORDMINI_DIR = os.environ.get("CHORDMINI_DIR", "/app/ChordMini")
 
 
 class AnalyzeRequest(BaseModel):
@@ -32,44 +26,68 @@ def verify_key(x_api_key: str):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def parse_lab_file(lab_path):
+    chords = []
+    with open(lab_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                chords.append({
+                    "chord": parts[2],
+                    "start": float(parts[0]),
+                    "end": float(parts[1]),
+                })
+    return chords
+
+
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest, x_api_key: str = Header(...)):
     verify_key(x_api_key)
 
-    # 1. Baixa o audio para um arquivo temporario
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
         urllib.request.urlretrieve(req.audio_url, tmp_path)
     except Exception as e:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
         raise HTTPException(status_code=502, detail=f"Download falhou: {e}")
 
+    with tempfile.NamedTemporaryFile(suffix=".lab", delete=False) as lab_tmp:
+        lab_path = lab_tmp.name
+
     try:
-        # 2. Inferencia usando o pipeline do ChordMini (BTC model).
-        #    O repo e clonado em /app/ChordMini no build do Docker.
-        #    Ajuste o import e a chamada conforme a API real do ChordMini -
-        #    a estrutura do repo tem python_backend/models/ChordMini/.
-        sys.path.insert(0, "/app/ChordMini/python_backend")
+        sys.path.insert(0, CHORDMINI_DIR)
+        from btc_chord_recognition import btc_chord_recognition
 
-        # TODO: ajustar ao API real do ChordMini apos clonar o repo.
-        # O pipeline tipico: carregar o modelo BTC -> extrair features
-        # (HCQT/chroma) -> inferencia -> pos-processamento (smoothing).
-        from models.ChordMini.inference import predict_chords  # ajustar nome real
+        ok = btc_chord_recognition(tmp_path, lab_path, model_variant="sl")
+        if not ok:
+            raise HTTPException(
+                status_code=500,
+                detail="btc_chord_recognition retornou False (checkpoint ausente ou erro de inferência).",
+            )
 
-        chords = predict_chords(tmp_path)
-        # chords esperado: [{ "chord": "Am", "start": 0.0, "end": 2.5 }, ...]
-
+        chords = parse_lab_file(lab_path)
         return JSONResponse({"chords": chords})
     except ImportError as e:
         raise HTTPException(
             status_code=500,
-            detail=f"ChordMini nao encontrado em /app/ChordMini. Verifique o Dockerfile. Erro: {str(e)}",
+            detail=f"btc_chord_recognition não encontrado em {CHORDMINI_DIR}. Verifique o Dockerfile. Erro: {str(e)}",
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Inference falhou: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Inferência falhou: {str(e)}")
     finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        for p in (tmp_path, lab_path):
+            if os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
 
 
 @app.get("/health")
