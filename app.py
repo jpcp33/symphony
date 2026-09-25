@@ -1,206 +1,118 @@
 """
-Microservice BTC (ChordMini) — detecção de acordes via modelo BTC-SL.
-
-Padrão assíncrono: POST /analyze inicia o processamento em background
-e retorna job_id imediatamente (<1s). GET /status/{job_id} consulta o
-resultado. Isso evita o timeout do proxy do Railway (~100s).
-
-O áudio é dividido em chunks de 60s com ffmpeg; cada chunk é processado
-sequencialmente pelo modelo BTC do ChordMini (commit 3d186fc). O estado
-do job fica em memória (dicionário global).
-
-Deploy: Railway. Ver README.md em base44/shared/btc-microservice/.
-
-POST /analyze  { audio_url }            ->  { job_id }
-GET  /status/{job_id}                    ->  { status, chords?, error? }
-GET  /health                             ->  { status: "ok" }
+Microservice yt-dlp-pot — extração de áudio do YouTube com PO Token.
 """
 import os
-import sys
-import json
 import uuid
 import tempfile
 import subprocess
-import urllib.request
 import threading
+import glob
+import socket
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="BTC Chord Service")
-API_KEY = os.environ.get("BTC_API_KEY", "")
+app = FastAPI(title="yt-dlp-pot Service")
+API_KEY = os.environ.get("YTDLP_API_KEY", "")
+BGUTIL_BASE = os.environ.get("BGUTIL_BASE", "http://127.0.0.1:4416")
+BGUTIL_PORT = int(BGUTIL_BASE.rsplit(":", 1)[-1] or "4416")
 
-CHORDMINI_DIR = os.environ.get("CHORDMINI_DIR", "/app/ChordMini")
-CHUNK_SECONDS = 60.0
+JOBS_DIR = os.path.join(tempfile.gettempdir(), "ytdlp_jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
 
-# Estado dos jobs em memória: {job_id: {status, chords, error, total_chunks, done_chunks}}
 _jobs = {}
-_btc_module = None
-_btc_lock = threading.Lock()
+_jobs_lock = threading.Lock()
 
-
-def _load_btc():
-    global _btc_module
-    if _btc_module is None:
-        sys.path.insert(0, CHORDMINI_DIR)
-        from btc_chord_recognition import btc_chord_recognition
-        _btc_module = btc_chord_recognition
-    return _btc_module
-
-
-class AnalyzeRequest(BaseModel):
-    audio_url: str
-
+class DownloadRequest(BaseModel):
+    youtube_url: str
 
 def verify_key(x_api_key: str):
     if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-
-def parse_lab_file(lab_path):
-    chords = []
-    with open(lab_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 3:
-                chords.append({
-                    "chord": parts[2],
-                    "start": float(parts[0]),
-                    "end": float(parts[1]),
-                })
-    return chords
-
-
-def get_audio_duration(audio_path):
+def run_ytdlp(job_id: str, youtube_url: str):
+    output_template = os.path.join(JOBS_DIR, f"{job_id}.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-x", "--audio-format", "mp3", "--audio-quality", "0",
+        "--no-playlist", "--quiet", "--no-progress", "--no-warnings",
+        "--extractor-args", f"youtubepot-bgutilhttp:base_url={BGUTIL_BASE}",
+        "-o", output_template,
+        youtube_url,
+    ]
     try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", audio_path],
-            capture_output=True, text=True, timeout=10,
-        )
-        info = json.loads(result.stdout)
-        return float(info["format"]["duration"])
-    except Exception:
-        return 0.0
-
-
-def split_audio(audio_path, chunk_sec):
-    duration = get_audio_duration(audio_path)
-    if duration == 0:
-        return [(audio_path, 0.0)]
-    chunks = []
-    offset = 0.0
-    idx = 0
-    while offset < duration:
-        chunk_path = tempfile.NamedTemporaryFile(suffix=f"_{idx}.wav", delete=False).name
-        subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(offset), "-t", str(chunk_sec),
-             "-i", audio_path, "-ac", "1", "-ar", "22050", chunk_path],
-            capture_output=True, timeout=30,
-        )
-        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 500:
-            chunks.append((chunk_path, offset))
-        offset += chunk_sec
-        idx += 1
-    return chunks
-
-
-def process_job(audio_url, job_id):
-    """Roda em background: baixa áudio, divide em chunks, processa cada um."""
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        urllib.request.urlretrieve(audio_url, tmp_path)
-
-        with _btc_lock:
-            btc_fn = _load_btc()
-
-        chunks = split_audio(tmp_path, CHUNK_SECONDS)
-        _jobs[job_id]["total_chunks"] = len(chunks)
-
-        all_chords = []
-        for chunk_path, offset in chunks:
-            lab_path = tempfile.NamedTemporaryFile(suffix=".lab", delete=False).name
-            try:
-                with _btc_lock:
-                    ok = btc_fn(chunk_path, lab_path, model_variant="sl")
-                if ok:
-                    chunk_chords = parse_lab_file(lab_path)
-                    for c in chunk_chords:
-                        all_chords.append({
-                            "chord": c["chord"],
-                            "start": c["start"] + offset,
-                            "end": c["end"] + offset,
-                        })
-            except Exception:
-                pass
-            finally:
-                if os.path.exists(lab_path):
-                    try:
-                        os.unlink(lab_path)
-                    except Exception:
-                        pass
-                if chunk_path != tmp_path and os.path.exists(chunk_path):
-                    try:
-                        os.unlink(chunk_path)
-                    except Exception:
-                        pass
-                _jobs[job_id]["done_chunks"] += 1
-
-        if not all_chords:
-            _jobs[job_id]["status"] = "error"
-            _jobs[job_id]["error"] = "Nenhum acorde detectado."
-        else:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error"] = (result.stderr or "yt-dlp falhou (código %d)" % result.returncode)[-2000:]
+            return
+        audio_path = os.path.join(JOBS_DIR, f"{job_id}.mp3")
+        if not os.path.exists(audio_path):
+            candidates = [f for f in glob.glob(os.path.join(JOBS_DIR, f"{job_id}.*")) if not f.endswith(".info.json")]
+            if candidates:
+                audio_path = candidates[0]
+        if not os.path.exists(audio_path):
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error"] = "Áudio não encontrado após download"
+            return
+        with _jobs_lock:
             _jobs[job_id]["status"] = "done"
-            _jobs[job_id]["chords"] = all_chords
-    except Exception as e:
-        _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(e)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
+            _jobs[job_id]["audio_path"] = audio_path
+    except subprocess.TimeoutExpired:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"] = "yt-dlp timeout (300s)"
+        for f in glob.glob(os.path.join(JOBS_DIR, f"{job_id}.*")):
             try:
-                os.unlink(tmp_path)
+                os.unlink(f)
             except Exception:
                 pass
+    except Exception as e:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"] = str(e)
 
-
-@app.post("/analyze")
-async def analyze(req: AnalyzeRequest, x_api_key: str = Header(...)):
+@app.post("/download")
+async def download(req: DownloadRequest, x_api_key: str = Header(...)):
     verify_key(x_api_key)
-
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {
-        "status": "processing",
-        "chords": None,
-        "error": None,
-        "total_chunks": 0,
-        "done_chunks": 0,
-    }
-
-    thread = threading.Thread(target=process_job, args=(req.audio_url, job_id), daemon=True)
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "processing", "audio_path": None, "error": None}
+    thread = threading.Thread(target=run_ytdlp, args=(job_id, req.youtube_url), daemon=True)
     thread.start()
-
     return JSONResponse({"job_id": job_id})
-
 
 @app.get("/status/{job_id}")
 async def status(job_id: str, x_api_key: str = Header(...)):
     verify_key(x_api_key)
-    if job_id not in _jobs:
-        raise HTTPException(status_code=404, detail="Job não encontrado.")
-    job = _jobs[job_id]
-    return JSONResponse({
-        "status": job["status"],
-        "chords": job["chords"],
-        "error": job["error"],
-        "total_chunks": job["total_chunks"],
-        "done_chunks": job["done_chunks"],
-    })
+    with _jobs_lock:
+        if job_id not in _jobs:
+            raise HTTPException(status_code=404, detail="Job não encontrado")
+        job = _jobs[job_id]
+        return JSONResponse({"status": job["status"], "error": job["error"]})
 
+@app.get("/result/{job_id}")
+async def result(job_id: str, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    with _jobs_lock:
+        if job_id not in _jobs:
+            raise HTTPException(status_code=404, detail="Job não encontrado")
+        job = _jobs[job_id]
+    if job["status"] != "done" or not job["audio_path"] or not os.path.exists(job["audio_path"]):
+        raise HTTPException(status_code=409, detail="Áudio não pronto")
+    return FileResponse(job["audio_path"], media_type="audio/mpeg", filename=f"{job_id}.mp3")
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    bgutil_ok = False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(("127.0.0.1", BGUTIL_PORT))
+        s.close()
+        bgutil_ok = True
+    except Exception:
+        bgutil_ok = False
+    return {"status": "ok", "bgutil": bgutil_ok}
