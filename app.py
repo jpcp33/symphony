@@ -33,6 +33,18 @@ API_KEY = os.environ.get("YTDLP_API_KEY", "")
 BGUTIL_BASE = os.environ.get("BGUTIL_BASE", "http://127.0.0.1:4416")
 BGUTIL_PORT = int(BGUTIL_BASE.rsplit(":", 1)[-1] or "4416")
 
+# Cookies do YouTube (formato Netscape) — contorna "Sign in to confirm you're not a bot"
+# em vídeos de major labels. Conteúdo colado na env var YTDLP_COOKIES.
+COOKIES_FILE = os.path.join(tempfile.gettempdir(), "ytdlp_cookies.txt")
+_cookies_raw = os.environ.get("YTDLP_COOKIES", "")
+if _cookies_raw.strip():
+    try:
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+            f.write(_cookies_raw if _cookies_raw.endswith("\n") else _cookies_raw + "\n")
+        os.chmod(COOKIES_FILE, 0o600)
+    except Exception:
+        pass
+
 JOBS_DIR = os.path.join(tempfile.gettempdir(), "ytdlp_jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -59,6 +71,9 @@ def run_ytdlp(job_id: str, youtube_url: str):
         "-o", output_template,
         youtube_url,
     ]
+    if os.path.exists(COOKIES_FILE):
+        cmd.insert(3, "--cookies")
+        cmd.insert(4, COOKIES_FILE)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
@@ -141,4 +156,4 @@ async def health():
         bgutil_ok = True
     except Exception:
         bgutil_ok = False
-    return {"status": "ok", "bgutil": bgutil_ok}
+    return {"status": "ok", "bgutil": bgutil_ok, "cookies": os.path.exists(COOKIES_FILE)}
